@@ -20,7 +20,9 @@ class BPMPV(PVGroup):
     tmit = pvproperty(value=0.0, name=':TMIT', read_only=True, mock_record='ai',
                    upper_disp_limit=1.0e10, lower_disp_limit=0)
     z = pvproperty(value=0.0, name=':Z', read_only=True, precision=2, units='m')
-    
+   
+  
+         
 class BPMService(simulacrum.Service):
     def __init__(self):
         super().__init__()
@@ -28,10 +30,9 @@ class BPMService(simulacrum.Service):
         #cmd socket is a synchronous socket, we don't want the asyncio context.
         self.cmd_socket = zmq.Context().socket(zmq.REQ)
         self.cmd_socket.connect("tcp://127.0.0.1:{}".format(os.environ.get('MODEL_PORT', 12312)))
-        bpms = self.fetch_bpm_list()
-        device_names = [simulacrum.util.convert_element_to_device(bpm[0]) for bpm in bpms]
-        device_name_map = zip(bpms, device_names)
-        bpm_pvs = {device_name: BPMPV(prefix=device_name) for device_name in device_names if device_name}
+        bpms_elements, bpms_devices = self.fetch_bpm_list() #bpms = self.fetch_bpm_list()
+        device_name_map = zip(bpms_elements, bpms_devices)
+        bpm_pvs = {device_name: BPMPV(prefix=device_name) for device_name in bpms_devices if device_name}
         self.add_pvs(bpm_pvs)
         one_hertz_aliases = {}
         for pv in self:
@@ -47,13 +48,13 @@ class BPMService(simulacrum.Service):
         # the results, which the Tao authors advise against because the format of the 
         # results might change.  Oh well, I can't figure out a better way to do it.
         L.info("Initializing with data from model service.")
-        bpms = self.fetch_bpm_list()
-        orbit = np.zeros(len(bpms), dtype=[('element_name', 'U60'), ('device_name', 'U60'), ('x', 'float32'), ('y', 'float32'), ('tmit', 'float32'), ('alive', 'bool'), ('z', 'float32')])
-        for i, row in enumerate(bpms):
+        bpms_elements, bpms_devices = self.fetch_bpm_list()
+        orbit = np.zeros(len(bpms_elements), dtype=[('element_name', 'U60'), ('device_name', 'U60'), ('x', 'float32'), ('y', 'float32'), ('tmit', 'float32'), ('alive', 'bool'), ('z', 'float32')])
+        for i, row in enumerate(bpms_elements):  
             (name, z) = row
             orbit['element_name'][i] = name
             try:
-                orbit['device_name'][i] = simulacrum.util.convert_element_to_device(name)
+                orbit['device_name'][i] = bpms_devices[i]
             except KeyError:
                 pass
             orbit['z'][i] = float(z)
@@ -61,9 +62,13 @@ class BPMService(simulacrum.Service):
         return orbit
     
     def fetch_bpm_list(self):
-        self.cmd_socket.send_pyobj({"cmd": "tao", "val": "show ele Instrument::BPM*,Instrument::RFB*"})
-        bpms = [row.split(None, 3)[1:3] for row in self.cmd_socket.recv_pyobj()['result'][:-1]]
-        return bpms
+        self.cmd_socket.send_pyobj({"cmd": "tao", "val": "show lat -no_label_lines -attribute alias Instrument::BPM*,Instrument::RFB*"})
+        bpms_elements = []
+        bpms_devices = [] 
+        for row in self.cmd_socket.recv_pyobj()['result']:
+            bpms_elements.append([row.split(None,5)[1],row.split(None,5)[3]])
+            bpms_devices.append(row.split(None,5)[5])
+        return bpms_elements, bpms_devices 
     
     async def publish_z(self):
         L.info("Publishing Z PVs")
@@ -91,10 +96,16 @@ class BPMService(simulacrum.Service):
                 L.debug(msg)
                 buf = memoryview(msg)
                 A = np.frombuffer(buf, dtype=md['dtype'])
-                A = A.reshape(md['shape'])
-                self.orbit['x'] = A[0]
-                self.orbit['y'] = A[1]
-                self.orbit['alive'] = A[2] > 0
+                A =  A.reshape(md['shape'])
+                self.orbit['alive'] = (A[2] > 0)
+                if np.all(self.orbit['alive']):
+                    self.orbit['x'] = A[0]
+                    self.orbit['y'] = A[1]
+                    self.orbit['tmit'] = 1.0e9               
+                else:
+                    self.orbit['x'] = float('NaN')
+                    self.orbit['y'] = float('NaN')
+                    self.orbit['tmit'] = 0.0
                 L.debug(self.orbit)
                 await self.publish_orbit()
             else: 
@@ -111,6 +122,8 @@ class BPMService(simulacrum.Service):
                 await self[row['device_name']+":X"].write(row['x'], severity=severity)
                 await self[row['device_name']+":Y"].write(row['y'], severity=severity)
                 await self[row['device_name']+":TMIT"].write(row['tmit'])
+
+
     
 def main():
     service = BPMService()
